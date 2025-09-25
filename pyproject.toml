@@ -1,0 +1,26 @@
+[project]
+name = "parallenv"
+version = "0.1.0"
+description = "Gymnasium inspired tools for (really) parallel Reinforcement Learning"
+readme = "README.md"
+authors = [
+    { name = "Adrián Pascual" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "gymnasium>=1.2.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+box2d = [
+    "gymnasium[box2d]>=1.2.0",
+]
+dev = [
+    "pre-commit>=4.3.0",
+    "pyright>=1.1.405",
+    "ruff>=0.13.2",
+]
