@@ -14,9 +14,12 @@ import numpy as np
 
 
 ObsType = TypeVar("ObsType")
-ActType = TypeVar("ActType")
+ActType = TypeVar("ActType", bound=np.ndarray)
 
-SeqType = TypeVar("SeqType", Sequence[Any], np.ndarray)
+T = TypeVar("T")
+
+Seq = list[Any] | np.ndarray
+Ids = list[int] | np.ndarray
 
 
 class EnvState(Enum):
@@ -283,7 +286,7 @@ class ParallEnv(Generic[ObsType, ActType]):
                 )
                 ob_idx = 0
 
-    def _filter_seq(self, seq: SeqType, mask: list[bool] | np.ndarray) -> SeqType:
+    def _filter_seq(self, seq: Seq, mask: list[bool] | np.ndarray) -> Seq:
         """A helper method to filter a sequence with a mask."""
         if isinstance(seq, np.ndarray):
             return seq[mask]
@@ -291,15 +294,15 @@ class ParallEnv(Generic[ObsType, ActType]):
         return filt_seq
 
     def _split_by_workers(
-        self, env_ids: Sequence[int] | np.ndarray, seqs: list[SeqType] | None = None
-    ) -> tuple[list[int], list[list[int]], list[list[SeqType]]]:
+        self, env_ids: Ids, seqs: list[Seq] | None = None
+    ) -> tuple[list[int], list[Ids], list[list[Seq]]]:
         """Assigns environment ids to their workers and splits sequences accordingly.
 
         Assigns an environment ids sequence to their correspondant worker, it can be
         used also to split any arbitrary sequence associated with the ids sequence.
 
         Args:
-            env_ids: A sequence of ids to be assigned to workers and split.
+            env_ids: A list (or array) of ids to be assigned to workers and split.
             seqs: A list of sequences with the same length as ids to be split.
 
         Returns:
@@ -363,7 +366,7 @@ class ParallEnv(Generic[ObsType, ActType]):
         if not len(env_ids) == len(set(env_ids)):
             raise ValueError("`ids` must not contain repeated values.")
 
-    def _check_envs_states_default(self, env_ids: Sequence[int]) -> bool:
+    def _check_envs_states_default(self, env_ids: Sequence[int] | np.ndarray) -> bool:
         """Check if given environments are in default state.
 
         Args:
@@ -376,9 +379,9 @@ class ParallEnv(Generic[ObsType, ActType]):
 
     def reset(
         self,
-        env_ids: Sequence[int] | np.ndarray | None = None,
+        env_ids: Ids | None = None,
         *,
-        seed: int | Sequence[int | None] | None = None,
+        seed: int | list[int | None] | np.ndarray | None = None,
         options: dict[str, Any] | None = None,
     ) -> None:
         """Resets selected sub-environments.
@@ -423,6 +426,8 @@ class ParallEnv(Generic[ObsType, ActType]):
             seed = [None for _ in range(len_ids)]
         elif isinstance(seed, int):
             seed = [seed + i for i in range(len_ids)]
+        else:
+            seed = seed
         if len(seed) != len_ids:
             raise ValueError(
                 f"If seeds are passed as a list the length must match the length of passed ids (in this case {len_ids}) but got length={len(seed)}."
@@ -437,18 +442,17 @@ class ParallEnv(Generic[ObsType, ActType]):
             )
             env_ids = [id_ for id_, flag in zip(env_ids, reset_mask) if flag]
             seed = [s for s, flag in zip(seed, reset_mask) if flag]
-
-        worker_indexes, per_worker_ids, (seeds,) = self._split_by_workers(
+        worker_indexes, per_worker_ids, (per_worker_seeds,) = self._split_by_workers(
             env_ids, [seed]
         )
         for worker_idx, worker_env_ids, worker_seed in zip(
-            worker_indexes, per_worker_ids, seeds
+            worker_indexes, per_worker_ids, per_worker_seeds
         ):
             self.command_queues[worker_idx].put(
                 ("reset", (worker_env_ids, {"seeds": worker_seed, "options": options}))
             )
 
-    def step(self, env_ids: Sequence[int], actions: ActType) -> None:
+    def step(self, env_ids: Ids, actions: ActType) -> None:
         """Queue a step for the given sub-environments.
 
         This method schedules a non-blocking step call for the provided
@@ -489,11 +493,11 @@ class ParallEnv(Generic[ObsType, ActType]):
             )
         for id_ in env_ids:
             self._envs_states[id_] = EnvState.WAITING_STEP
-        worker_indexes, per_worker_ids, (actions,) = self._split_by_workers(
+        worker_indexes, per_worker_ids, (per_worker_actions,) = self._split_by_workers(
             env_ids, [actions]
         )
         for worker_idx, worker_env_ids, worker_actions in zip(
-            worker_indexes, per_worker_ids, actions
+            worker_indexes, per_worker_ids, per_worker_actions
         ):
             self.command_queues[worker_idx].put(
                 ("step", (worker_env_ids, worker_actions))
@@ -630,5 +634,6 @@ def _parallel_worker(
                 experience_queue.put((id_, (observation, None, None, None, info)))
         elif command == "close":
             break
+    for env in envs:
+        env.close()
     experience_queue.put(ClosingSentinel())
-    env.close()
