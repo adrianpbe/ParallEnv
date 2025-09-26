@@ -4,7 +4,7 @@ A small library that provides an RL environment class for parallelization. The c
 
 # Usage Example
 
-```
+```python
 import gymnasium as gym
 from parallenv import ParallEnv
 
