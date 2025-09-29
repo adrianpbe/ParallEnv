@@ -6,6 +6,7 @@ from multiprocessing import connection
 import queue
 import threading
 from typing import Any, Generic, TypeVar
+from warnings import warn
 
 import gymnasium as gym
 from gymnasium.vector import AutoresetMode
@@ -103,6 +104,7 @@ class ParallEnv(Generic[ObsType, ActType]):
         )
 
         self.closed = False
+        self._has_reset = False
         self.num_envs = len(env_fns)
         self.envs_ids = list(range(self.num_envs))
         self.workers_envs_ids = split_n(self.envs_ids, self.num_workers)
@@ -386,6 +388,14 @@ class ParallEnv(Generic[ObsType, ActType]):
     ) -> None:
         """Resets selected sub-environments.
 
+        Specific sub-environments can be reset, while this is useful, especially
+        if autoreset is disable, the first time reset is call it ha to
+        be applied to all the sub-environments, if not further `gather` calls could
+        block forever, in the case that less environments that the `batch_size` are
+        reset. Hence, although `env_ids` (or `reset_mask` in options) can be passed
+        to the method during the first reset it will be ignored and all sub-environments
+        will be reset.
+
         Args:
             env_ids: Id of environments to be reset. If not passed (or explicitly passed None)
               then all sub-environments are reset.
@@ -411,6 +421,18 @@ class ParallEnv(Generic[ObsType, ActType]):
         """
         if self.closed:
             raise ClosedEnvError("Trying to operate on ParallEnv after close().")
+
+        if not self._has_reset:
+            if env_ids is None:
+                warn(
+                    "env_ids has been passed during the first reset, it will be ignored and all sub-environments will be reset instead."
+                )
+                env_ids = list(range(self.num_envs))
+            if options is not None and "reset_mask" in options:
+                warn(
+                    "reset_mask has been passed during the first reset, it will be ignored and all sub-environments will be reset instead."
+                )
+                del options["reset_mask"]
         if env_ids is None:
             env_ids = list(range(self.num_envs))
         else:
@@ -435,7 +457,7 @@ class ParallEnv(Generic[ObsType, ActType]):
 
         # Options is the same for all the environments, as it is in gym.vector.VectorEnv,
         #  except for reset_mask, this option is remove from the options dict here.
-        if options is not None and "reset_mask":
+        if options is not None and "reset_mask" in options:
             reset_mask = options.pop("reset_mask")
             assert isinstance(reset_mask, np.ndarray), (
                 f"`options['reset_mask': mask]` must be a numpy array, got {type(reset_mask)}"
@@ -451,6 +473,8 @@ class ParallEnv(Generic[ObsType, ActType]):
             self.command_queues[worker_idx].put(
                 ("reset", (worker_env_ids, {"seeds": worker_seed, "options": options}))
             )
+        if not self._has_reset:
+            self._has_reset = True
 
     def step(self, env_ids: Ids, actions: ActType) -> None:
         """Queue a step for the given sub-environments.
@@ -554,6 +578,9 @@ class ParallEnv(Generic[ObsType, ActType]):
         connection.wait([p.sentinel for p in self.processes])
         self.consumer_worker.join()
         self.closed = True
+
+    def empty(self):
+        return self.batches_queue.empty()
 
 
 def _step_auto_disable(env: gym.Env, action, autoreset: bool):
