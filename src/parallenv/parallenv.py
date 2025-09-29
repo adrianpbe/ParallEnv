@@ -437,12 +437,12 @@ class ParallEnv(Generic[ObsType, ActType]):
             env_ids = list(range(self.num_envs))
         else:
             self._check_raise_env_ids(env_ids)
-            if not self._check_envs_states_default(env_ids):
-                raise AlreadyPendingEnvError(
-                    "There are environments waiting for a pending call"
-                )
-            for id_ in env_ids:
-                self._envs_states[id_] = EnvState.WAITING_RESET
+        if not self._check_envs_states_default(env_ids):
+            raise AlreadyPendingEnvError(
+                "There are environments waiting for a pending call"
+            )
+        for id_ in env_ids:
+            self._envs_states[id_] = EnvState.WAITING_RESET
         len_ids = len(env_ids)
         if seed is None:
             seed = [None for _ in range(len_ids)]
