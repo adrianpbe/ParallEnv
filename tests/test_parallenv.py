@@ -8,6 +8,7 @@ from parallenv.parallenv import (
     ParallEnv,
     AlreadyPendingEnvError,
     ClosedEnvError,
+    AutoresetMode,
 )
 
 
@@ -35,38 +36,24 @@ class IdEnv(gym.Env):
 class TerminateOnFirstStepEnv(gym.Env):
     """Environment that terminates on the first step after a reset."""
 
-    def __init__(self, id: int = 0):
-        self.id = id
+    def __init__(self):
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(1,), dtype=np.float32
         )
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
-        self._stepped = False
 
     def step(self, action):
-        # First step after reset: terminate
-        if not self._stepped:
-            self._stepped = True
-            return (
-                np.array([0.5], dtype=np.float32),
-                1.0,
-                True,
-                False,
-                {"env_id": self.id, "step": 1},
-            )
-        # Subsequent steps keep returning a normal non-terminal transition
         return (
-            np.array([0.7], dtype=np.float32),
-            0.5,
-            False,
-            False,
-            {"env_id": self.id, "step": 2},
+            np.array([1.0], dtype=np.float32),
+            1.0,
+            True,
+            True,
+            {},
         )
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed, options=options)
-        self._stepped = False
-        return np.array([0.1], dtype=np.float32), {"env_id": self.id, "reset": True}
+        return np.array([0.0], dtype=np.float32), {"reset": True}
 
 
 def test_ids_experience_alignment():
@@ -126,3 +113,77 @@ def test_closed_env_error_after_close():
         envs.step(env_ids=[0], actions=np.array([[0.0]], dtype=np.float32))
     with pytest.raises(ClosedEnvError):
         envs.gather(timeout=1)
+
+
+def test_autoreset_next_step():
+    envs = ParallEnv(
+        env_fns=[TerminateOnFirstStepEnv],
+        batch_size=1,
+        num_workers=1,
+        autoreset_mode=AutoresetMode.NEXT_STEP,
+    )
+    envs.reset()
+    ids, observation, reward, terminated, truncated, info = envs.gather()
+    assert not (terminated or truncated)
+
+    envs.step(env_ids=[0], actions=np.array([[0.0]], dtype=np.float32))
+    ids, observation, reward, terminated, truncated, info = envs.gather()
+    assert terminated or truncated
+    assert np.array_equal(np.array([[1.0]], dtype=np.float32), observation)
+
+    envs.step(env_ids=[0], actions=np.array([[0.0]], dtype=np.float32))
+    ids, observation, reward, terminated, truncated, info = envs.gather()
+    envs.step(env_ids=[0], actions=np.array([[0.0]], dtype=np.float32))
+    assert "reset" in info
+    assert not (terminated or truncated)
+
+
+def test_autoreset_same_step():
+    envs = ParallEnv(
+        env_fns=[TerminateOnFirstStepEnv],
+        batch_size=1,
+        num_workers=1,
+        autoreset_mode=AutoresetMode.SAME_STEP,
+    )
+    envs.reset()
+    ids, observation, reward, terminated, truncated, info = envs.gather()
+    assert not (terminated or truncated)
+    envs.step(env_ids=[0], actions=np.array([[0.0]], dtype=np.float32))
+    ids, observation, reward, terminated, truncated, info = envs.gather()
+    assert terminated or truncated
+    assert "final_obs" in info
+    assert np.array_equal(np.array([1.0], dtype=np.float32), info["final_obs"][0])
+    assert "final_info" in info
+    assert np.array_equal(np.array([[0.0]], dtype=np.float32), observation)
+    assert "reset" in info
+
+
+def test_autoreset_disable():
+    envs = ParallEnv(
+        env_fns=[TerminateOnFirstStepEnv],
+        batch_size=1,
+        num_workers=1,
+        autoreset_mode=AutoresetMode.DISABLED,
+    )
+
+    envs.reset()
+    ids, observation, reward, terminated, truncated, info = envs.gather()
+    assert not (terminated or truncated)
+
+    envs.step(env_ids=[0], actions=np.array([[0.0]], dtype=np.float32))
+    ids, observation, reward, terminated, truncated, info = envs.gather()
+    assert terminated or truncated
+    assert np.array_equal(np.array([[1.0]], dtype=np.float32), observation)
+
+    # If not manually reset it keeps returning the terminal step
+    envs.step(env_ids=[0], actions=np.array([[0.0]], dtype=np.float32))
+    ids, observation, reward, terminated, truncated, info = envs.gather()
+    assert terminated or truncated
+    assert np.array_equal(np.array([[1.0]], dtype=np.float32), observation)
+
+    envs.reset(env_ids=[0])
+    ids, observation, reward, terminated, truncated, info = envs.gather()
+    assert np.array_equal(np.array([[0.0]], dtype=np.float32), observation)
+
+    assert not (terminated or truncated)
+    assert "reset" in info

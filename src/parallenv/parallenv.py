@@ -9,7 +9,6 @@ from typing import Any, Generic, TypeVar
 from warnings import warn
 
 import gymnasium as gym
-from gymnasium.vector import AutoresetMode
 from gymnasium.vector.utils import batch_space, concatenate, create_empty_array
 import numpy as np
 
@@ -21,6 +20,14 @@ T = TypeVar("T")
 
 Seq = list[Any] | np.ndarray
 Ids = list[int] | np.ndarray
+
+
+class AutoresetMode(Enum):
+    """Enum representing the different autoreset modes, next step, same step and disabled."""
+
+    NEXT_STEP = "NextStep"
+    SAME_STEP = "SameStep"
+    DISABLED = "Disabled"
 
 
 class EnvState(Enum):
