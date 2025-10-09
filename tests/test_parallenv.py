@@ -1,9 +1,12 @@
 import functools
-import pytest
+import queue
+import time
 
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
+import pytest
+
 from parallenv.parallenv import (
     ParallEnv,
     AlreadyPendingEnvError,
@@ -54,6 +57,108 @@ class TerminateOnFirstStepEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed, options=options)
         return np.array([0.0], dtype=np.float32), {"reset": True}
+
+
+class ExceptionEnv(gym.Env):
+    """Environment that can fail in a given step."""
+
+    def __init__(self, exception_step: int | None = None):
+        self.exception_step = exception_step
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=(1,), dtype=np.float32
+        )
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        self.num_step = 0
+
+    def _raise_if_needed(self):
+        if self.exception_step is None:
+            return
+        if self.num_step >= self.exception_step:
+            raise RuntimeError("The environment failed!")
+
+    def step(self, action):
+        self.num_step += 1
+        self._raise_if_needed()
+        return np.array([0.0], dtype=np.float32), 0.0, False, False, {}
+
+    def reset(
+        self,
+        *,
+        seed=None,
+        options=None,
+    ):
+        super().reset(seed=seed, options=options)
+        self.num_step = 0
+        self._raise_if_needed()
+        return np.array([0.0], dtype=np.float32), {}
+
+
+class DelayedEnv(gym.Env):
+    """Environment which steps take some time to finish"""
+
+    def __init__(self, delay_seconds: float):
+        self.delay_seconds = delay_seconds
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=(1,), dtype=np.float32
+        )
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+
+    def step(self, action):
+        time.sleep(self.delay_seconds)
+        return np.array([0.0], dtype=np.float32), 0.0, False, False, {}
+
+    def reset(
+        self,
+        *,
+        seed=None,
+        options=None,
+    ):
+        super().reset(seed=seed, options=options)
+        return np.array([0.0], dtype=np.float32), {}
+
+
+def test_too_big_batch_size_exception():
+    env_fns = [functools.partial(IdEnv, i) for i in range(4)]
+    with pytest.raises(ValueError):
+        envs = ParallEnv(  # noqa: F841
+            env_fns=env_fns,
+            batch_size=8,
+            num_workers=4,
+        )
+
+
+def test_sub_environment_propagated_exception():
+    env_fns = [
+        lambda: ExceptionEnv(),
+        lambda: ExceptionEnv(1),
+    ]
+    envs = ParallEnv(
+        env_fns=env_fns,
+        batch_size=2,
+        num_workers=2,
+    )
+    envs.reset()
+    ids, observation, reward, terminated, truncated, info = envs.gather()
+    envs.step(ids, np.array([[0.0], [0.0]], dtype=np.float32))
+    with pytest.raises(RuntimeError):
+        envs.gather()
+    assert envs._close_sentinels == 1  # This assertion may be unsafe!
+    envs.close()
+
+
+def test_gather_timeout():
+    env_fns = [lambda: DelayedEnv(2)]
+    envs = ParallEnv(
+        env_fns=env_fns,
+        batch_size=1,
+        num_workers=1,
+    )
+    envs.reset()
+    # Exception reset is inmediate, so we don't test this gather
+    ids, observation, reward, terminated, truncated, info = envs.gather()
+    envs.step(env_ids=[0], actions=np.array([[0.0]], dtype=np.float32))
+    with pytest.raises(queue.Empty):
+        ids, observation, reward, terminated, truncated, info = envs.gather(0.1)
 
 
 def test_ids_experience_alignment():

@@ -2,9 +2,11 @@ from collections.abc import Callable, Sequence
 from enum import Enum
 from math import ceil
 import multiprocessing as mp
-from multiprocessing import connection
 import queue
+import sys
 import threading
+import time
+import traceback
 from typing import Any, Generic, TypeVar
 from warnings import warn
 
@@ -88,7 +90,8 @@ class ParallEnv(Generic[ObsType, ActType]):
         Args:
             env_fns: Callables that construct the sub-environments. Environments are sharded across worker processes;
                 a single worker may manage several environments.
-            batch_size: Number of experiences to aggregate per output batch returned by :meth:`gather`.
+            batch_size: Number of experiences to aggregate per output batch returned by :meth:`gather`, it must be
+                smaller than the number of sub-environments (length of `env_fns`).
             num_workers: Number of worker processes. Sub-environments are split across workers.
             daemon: Whether worker processes are started as daemons.
             autoreset_mode: Autoreset strategy used by sub-environments. See
@@ -99,7 +102,14 @@ class ParallEnv(Generic[ObsType, ActType]):
               the next available batch of size ``batch_size``.
             - ``action_space`` and ``observation_space`` are batched for ``batch_size`` items (not ``num_envs``).
             - ``metadata["autoreset_mode"]`` is set to the chosen mode for downstream wrappers/tools.
+
+        Raises:
+            ValueError: if the batch_size is smaller than the number of sub-environments.
         """
+        if batch_size > len(env_fns):
+            raise ValueError(
+                f"batch_size ({batch_size}) must not be greater than the number of sub-environments ({len(env_fns)})."
+            )
         self.env_fns = env_fns
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -142,6 +152,7 @@ class ParallEnv(Generic[ObsType, ActType]):
         ]
 
         self.experience_queue = mp.SimpleQueue()
+        self._error_queue = mp.SimpleQueue()
         self.batches_queue = queue.Queue()
 
         self.command_queues: list[mp.SimpleQueue] = []
@@ -153,9 +164,11 @@ class ParallEnv(Generic[ObsType, ActType]):
                 target=_parallel_worker,
                 name=f"Worker<{type(self).__name__}>-{worker_idx}",
                 args=(
+                    worker_idx,
                     workers_envs_fns[worker_idx],
                     command_queue,
                     self.experience_queue,
+                    self._error_queue,
                     self.workers_envs_ids[worker_idx],
                     self.autoreset_mode,
                 ),
@@ -247,12 +260,12 @@ class ParallEnv(Generic[ObsType, ActType]):
             {},
         )
         ob_idx = 0
-        close_sentinels = 0
+        self._close_sentinels = 0
         while True:
             received = self.experience_queue.get()
             if isinstance(received, ClosingSentinel):
-                close_sentinels += 1
-                if close_sentinels == self.num_workers:
+                self._close_sentinels += 1
+                if self._close_sentinels == self.num_workers:
                     break
                 else:
                     continue
@@ -535,7 +548,7 @@ class ParallEnv(Generic[ObsType, ActType]):
             )
 
     def gather(
-        self, timeout: int | None = None
+        self, timeout: float | None = None
     ) -> tuple[np.ndarray, ObsType, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
         """Retrieve the next available batch of experiences.
 
@@ -558,10 +571,26 @@ class ParallEnv(Generic[ObsType, ActType]):
         Raises:
             ClosedEnvError: If the environment has already been closed.
             queue.Empty: If `timeout` (is not None and) elapses before a batch becomes available.
+            Exception: Propagates any exception raised by the sub-environments.
         """
         if self.closed:
             raise ClosedEnvError("Trying to operate on ParallEnv after close().")
-        batch = self.batches_queue.get(timeout=timeout)
+        # This loop is used to prevent blocking forever in the case some sub-environment fail
+        #  and it's not possible to fill the batches_queue.
+        t = 0
+        t0 = time.perf_counter()
+        while True:
+            self._raise_if_error()
+            try:
+                batch = self.batches_queue.get(timeout=0.05)
+            except queue.Empty:
+                if timeout is not None:
+                    t = time.perf_counter() - t0
+                    if t >= timeout:
+                        raise queue.Empty
+            else:
+                break
+
         ids = batch[0]
         for id_ in ids:
             self._envs_states[id_] = EnvState.DEFAULT
@@ -582,12 +611,36 @@ class ParallEnv(Generic[ObsType, ActType]):
             return None
         for command_queue in self.command_queues:
             command_queue.put(("close", None))
-        connection.wait([p.sentinel for p in self.processes])
+        for p in self.processes:
+            p.join()
+            p.close()
         self.consumer_worker.join()
+        for command_queue in self.command_queues:
+            command_queue.close()
+        self._error_queue.close()
+        self.experience_queue.close()
         self.closed = True
 
     def empty(self):
         return self.batches_queue.empty()
+
+    def _raise_if_error(self):
+        if self._error_queue.empty():
+            return
+        exceptions = []
+        while not self._error_queue.empty():
+            # This could be not safe, blocking forever, in case error_queue
+            #  is emptied anywhere else!
+            worker_idx, exctype, value, trace = self._error_queue.get()
+            warn(
+                f"Received the following error from Worker-{worker_idx} - Shutting it down"
+            )
+            warn(f"{trace}")
+            exceptions.append((exctype, value))
+        if exceptions:
+            exctype, value = exceptions[-1]
+            warn("Raising the last exception back to the main process.")
+            raise exctype(value)
 
 
 def _step_auto_disable(env: gym.Env, action, autoreset: bool):
@@ -626,9 +679,11 @@ step_fn_dict = {
 
 
 def _parallel_worker(
+    worker_idx,
     env_fns: Sequence[Callable[[], gym.Env]],
     commands_queue: mp.SimpleQueue,
     experience_queue: mp.SimpleQueue,
+    error_queue: mp.SimpleQueue,
     envs_ids: list[int],
     autoreset_mode: AutoresetMode,
 ):
@@ -642,32 +697,38 @@ def _parallel_worker(
 
     # Autoreset state for NEXT_STEP autoreset mode
     autoreset = [False for _ in envs]
-
-    while True:
-        command, data = commands_queue.get()
-        if command == "step":
-            ids, actions = data
-            for i, id_ in enumerate(ids):
-                env_index = env_id_to_index[id_]
-                env = envs[env_index]
-                ((observation, reward, terminated, truncated, info), env_autoreset) = (
-                    step_fn(env, actions[i], autoreset[env_index])
-                )
-                autoreset[env_index] = env_autoreset
-                experience_queue.put(
-                    (id_, (observation, reward, terminated, truncated, info))
-                )
-        elif command == "reset":
-            ids, all_kwargs = data
-            seeds = all_kwargs["seeds"]
-            options = all_kwargs["options"]
-            for i, id_ in enumerate(ids):
-                env_index = env_id_to_index[id_]
-                env = envs[env_index]
-                observation, info = env.reset(seed=seeds[i], options=options)
-                experience_queue.put((id_, (observation, None, None, None, info)))
-        elif command == "close":
-            break
-    for env in envs:
-        env.close()
-    experience_queue.put(ClosingSentinel())
+    try:
+        while True:
+            command, data = commands_queue.get()
+            if command == "step":
+                ids, actions = data
+                for i, id_ in enumerate(ids):
+                    env_index = env_id_to_index[id_]
+                    env = envs[env_index]
+                    (
+                        (observation, reward, terminated, truncated, info),
+                        env_autoreset,
+                    ) = step_fn(env, actions[i], autoreset[env_index])
+                    autoreset[env_index] = env_autoreset
+                    experience_queue.put(
+                        (id_, (observation, reward, terminated, truncated, info))
+                    )
+            elif command == "reset":
+                ids, all_kwargs = data
+                seeds = all_kwargs["seeds"]
+                options = all_kwargs["options"]
+                for i, id_ in enumerate(ids):
+                    env_index = env_id_to_index[id_]
+                    env = envs[env_index]
+                    observation, info = env.reset(seed=seeds[i], options=options)
+                    experience_queue.put((id_, (observation, None, None, None, info)))
+            elif command == "close":
+                break
+    except Exception:
+        error_type, error_message, _ = sys.exc_info()
+        trace = traceback.format_exc()
+        error_queue.put((worker_idx, error_type, error_message, trace))
+    finally:
+        for env in envs:
+            env.close()
+        experience_queue.put(ClosingSentinel())
