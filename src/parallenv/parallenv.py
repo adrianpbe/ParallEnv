@@ -399,6 +399,34 @@ class ParallEnv(Generic[ObsType, ActType]):
         """
         return all(self._envs_states[id_] == EnvState.DEFAULT for id_ in env_ids)
 
+    def _get_batch(self, timeout: float | None):
+        """Waits for a batch of experience.
+
+        This is used instead of just waiting with the get method of `batches_queue`
+        to prevent blocking forever if some sub-environment fails.
+
+        Args:
+            timeout: Optional timeout in seconds to wait for a batch. If `None`,
+                waits indefinitely.
+
+        Raises:
+            queue.Empty: If `timeout` (is not None and) elapses before a batch becomes available.
+        """
+        t = 0
+        t0 = time.perf_counter()
+        while True:
+            self._raise_if_error()
+            try:
+                batch = self.batches_queue.get(timeout=0.05)
+            except queue.Empty:
+                if timeout is not None:
+                    t = time.perf_counter() - t0
+                    if t >= timeout:
+                        raise queue.Empty
+            else:
+                break
+        return batch
+
     def reset(
         self,
         env_ids: Ids | None = None,
@@ -575,22 +603,7 @@ class ParallEnv(Generic[ObsType, ActType]):
         """
         if self.closed:
             raise ClosedEnvError("Trying to operate on ParallEnv after close().")
-        # This loop is used to prevent blocking forever in the case some sub-environment fail
-        #  and it's not possible to fill the batches_queue.
-        t = 0
-        t0 = time.perf_counter()
-        while True:
-            self._raise_if_error()
-            try:
-                batch = self.batches_queue.get(timeout=0.05)
-            except queue.Empty:
-                if timeout is not None:
-                    t = time.perf_counter() - t0
-                    if t >= timeout:
-                        raise queue.Empty
-            else:
-                break
-
+        batch = self._get_batch(timeout)
         ids = batch[0]
         for id_ in ids:
             self._envs_states[id_] = EnvState.DEFAULT
